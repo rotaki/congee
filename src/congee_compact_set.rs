@@ -11,12 +11,11 @@
 //!
 //! ```text
 //! Node Structure:
-//! [Header: 4 bytes][Prefix: variable][Children: variable]
+//! [Header: 2 bytes][Prefix: variable][Children: variable]
 //!
-//! Header (NodeHeader - 4 bytes, packed):
-//! - node_type: u8     - Node type (N4/N16/N48/N256, Internal/Leaf)
-//! - prefix_len: u8    - Length of prefix bytes
-//! - children_len: u16 - Number of children in this node
+//! Header (NodeHeader - 2 bytes, packed):
+//! - type_and_prefix: u8 - bits 2-0 = node_type (0-7), bits 5-3 = prefix_len (0-7), bits 7-6 = padding
+//! - children_len: u8 - children count - 1 (supports 1-256 children using 0-255 encoding)
 //! ```
 //!
 //! ### Node Types and Their Layouts
@@ -33,14 +32,16 @@
 //!
 //! #### N48 Internal Nodes
 //! ```text
-//! [Header][Prefix][Key Array: 256 bytes][Child Offsets: children_len * 4 bytes]
+//! [Header][Prefix][Key Array: 32 bytes (256 bits bitmap)][Precomputed offsets: 4 bytes][Child Offsets: children_len * 4 bytes]
 //! Key Array: direct lookup where key_array[byte_value] gives 1-based index into child offsets
 //! ```
 //!
 //! #### N256 Internal Nodes
 //! ```text
-//! [Header][Prefix][Direct Offsets: 256 * 4 bytes]
-//! Direct lookup where each 4-byte slot contains the child offset for that byte value
+//! Uses the concept of straight lines to compress the offsets.
+//! The line is defined by a slope and intercept. The difference is the actual offset minus the predicted offset.
+//! [Header][Prefix][Slope: 4 bytes][Intercept: 4 bytes][Differences: 256 * 2 bytes]
+//! Linear compression format where actual_offset = slope * sequential_index + intercept + difference
 //! ```
 //!
 //! #### N4/N16 Leaf Nodes:
@@ -80,10 +81,31 @@ impl NodeType {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct NodeHeader {
-    node_type: u8,
-    prefix_len: u8,
-    children_len: u16,
+pub(crate) struct NodeHeader {
+    type_and_prefix: u8,
+    children_len: u8,
+}
+
+impl NodeHeader {
+    #[inline]
+    fn node_type(&self) -> u8 {
+        self.type_and_prefix & 0x7
+    }
+
+    #[inline]
+    fn prefix_len(&self) -> u8 {
+        (self.type_and_prefix >> 3) & 0x7
+    }
+
+    #[inline]
+    fn children_len(&self) -> usize {
+        (self.children_len as usize) + 1
+    }
+
+    #[inline]
+    pub(crate) fn pack_type_and_prefix(node_type: u8, prefix_len: u8) -> u8 {
+        (node_type & 0x7) | ((prefix_len & 0x7) << 3)
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -454,7 +476,7 @@ where
 
     #[inline]
     fn get_node_header(&self, offset: usize) -> &NodeHeader {
-        if offset + 4 > self.data.len() {
+        if offset + 2 > self.data.len() {
             panic!("Node offset {offset} out of bounds");
         }
 
@@ -464,8 +486,8 @@ where
     #[inline]
     fn get_node_prefix(&self, offset: usize) -> &[u8] {
         let header = *self.get_node_header(offset);
-        let prefix_start = offset + 4;
-        let prefix_len = header.prefix_len as usize;
+        let prefix_start = offset + 2;
+        let prefix_len = header.prefix_len() as usize;
         &self.data[prefix_start..prefix_start + prefix_len]
     }
 
@@ -568,12 +590,12 @@ where
 
             let header =
                 unsafe { *(self.data.as_ptr().add(current_node_offset) as *const NodeHeader) };
-            let node_type = header.node_type;
-            let prefix_len = header.prefix_len as usize;
-            let children_len = header.children_len as usize;
+            let node_type = header.node_type();
+            let prefix_len = header.prefix_len() as usize;
+            let children_len = header.children_len();
 
             if prefix_len > 0 {
-                let prefix_start = current_node_offset + 4;
+                let prefix_start = current_node_offset + 2;
                 if key_pos + prefix_len > key.len() {
                     return false;
                 }
@@ -587,7 +609,7 @@ where
 
             let next_key_byte = key[key_pos];
 
-            let children_start = current_node_offset + 4 + prefix_len;
+            let children_start = current_node_offset + 2 + prefix_len;
             let mut found_child = None;
 
             match node_type {
@@ -631,12 +653,35 @@ where
                         stats.n48_internal_accesses += 1;
                     }
 
-                    // O(1) lookup. key_array[key] gives 1-based index into child_indices
-                    let key_array_index = next_key_byte as usize;
-                    let child_array_index = self.data[children_start + key_array_index];
+                    // bitmap lookup using precomputed popcount values
+                    use crate::utils::{count_ones_up_to_precomputed, is_bit_set};
 
-                    if child_array_index != 0 {
-                        found_child = Some(child_array_index as usize);
+                    // Layout: [precomputed popcounts (4 bytes)][bitmap (32 bytes)][child offsets]
+                    let precomputed_start = children_start;
+                    let bitmap_start = children_start + 4;
+
+                    // Read precomputed popcount values (handle potential misalignment)
+                    let precomputed = [
+                        self.data[precomputed_start],
+                        self.data[precomputed_start + 1],
+                        self.data[precomputed_start + 2],
+                        self.data[precomputed_start + 3],
+                    ];
+
+                    // Read bitmap
+                    let bitmap = unsafe {
+                        std::slice::from_raw_parts(self.data.as_ptr().add(bitmap_start), 32)
+                    };
+                    let bitmap_array = unsafe { *(bitmap.as_ptr() as *const [u8; 32]) };
+
+                    if is_bit_set(&bitmap_array, next_key_byte) {
+                        // Calculate the index using precomputed values for O(1) lookup
+                        let child_array_index = count_ones_up_to_precomputed(
+                            &precomputed,
+                            &bitmap_array,
+                            next_key_byte,
+                        );
+                        found_child = Some(child_array_index + 1); // Convert to 1-based index
                     }
                 }
                 NodeType::N48_LEAF => {
@@ -663,14 +708,13 @@ where
                         stats.n256_internal_accesses += 1;
                     }
 
-                    // O(1) direct lookup: direct_array[key] gives node index
-                    let direct_index_offset = children_start + next_key_byte as usize * 4;
-                    let node_index = u32::from_le_bytes(
-                        self.data[direct_index_offset..direct_index_offset + 4]
-                            .try_into()
-                            .unwrap(),
+                    // Read difference for this key
+                    let diff_offset = children_start + 8 + next_key_byte as usize * 2;
+                    let difference = i16::from_le_bytes(
+                        self.data[diff_offset..diff_offset + 2].try_into().unwrap(),
                     );
-                    if node_index != 0 {
+
+                    if difference != i16::MIN {
                         found_child = Some(next_key_byte as usize); // Use key as dummy index
                     }
                 }
@@ -681,7 +725,7 @@ where
                         stats.n256_leaf_accesses += 1;
                     }
 
-                    // O(1) bitmap lookup: check if bit is set for this key
+                    // check if bit is set for this key
                     let byte_idx = next_key_byte as usize / 8;
                     let bit_idx = next_key_byte as usize % 8;
                     let bitmap_byte = self.data[children_start + byte_idx];
@@ -691,7 +735,7 @@ where
                     }
                 }
                 _ => {
-                    // Unknown node type - should not happen
+                    panic!("Unknown node type: {node_type}");
                 }
             }
 
@@ -707,7 +751,7 @@ where
                         }
                         NodeType::N48_INTERNAL => {
                             // For N48_INTERNAL, child_idx is 1-based index into child_offsets array
-                            let child_offsets_start = children_start + 256; // After key array
+                            let child_offsets_start = children_start + 36; // After precomputed (4) + bitmap (32)
                             let child_offset_location = child_offsets_start + (child_idx - 1) * 4; // Convert to 0-based
                             let next_node_offset = u32::from_le_bytes(
                                 self.data[child_offset_location..child_offset_location + 4]
@@ -724,14 +768,35 @@ where
                             }
                         }
                         NodeType::N256_INTERNAL => {
-                            // For N256_INTERNAL, we read the node_offset directly
-                            let direct_offset_location =
-                                children_start + next_key_byte as usize * 4;
-                            let next_node_offset = u32::from_le_bytes(
-                                self.data[direct_offset_location..direct_offset_location + 4]
+                            // For N256_INTERNAL, calculate the offset using the slope and intercept
+                            let slope = u32::from_le_bytes(
+                                self.data[children_start..children_start + 4]
                                     .try_into()
                                     .unwrap(),
-                            ) as usize;
+                            );
+                            let intercept = u32::from_le_bytes(
+                                self.data[children_start + 4..children_start + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+
+                            // Read difference for this key
+                            let diff_offset = children_start + 8 + next_key_byte as usize * 2;
+                            let difference = i16::from_le_bytes(
+                                self.data[diff_offset..diff_offset + 2].try_into().unwrap(),
+                            ) as i32;
+
+                            if difference > i16::MAX as i32 || difference < i16::MIN as i32 {
+                                panic!("Difference is greater than i16::MAX. Should not happen.");
+                            }
+                            if difference == i16::MIN as i32 {
+                                // No child at this key
+                                return false;
+                            }
+
+                            // Reconstruct the actual offset using direct indexing
+                            let predicted_offset = slope * next_key_byte as u32 + intercept;
+                            let next_node_offset = (predicted_offset as i32 + difference) as usize;
 
                             if next_node_offset == 0 {
                                 // Found stored value at this position
@@ -743,7 +808,6 @@ where
                         }
                         _ => {
                             // N4/N16 internal nodes: [keys][offsets] layout
-                            let children_len = header.children_len as usize;
                             let offset_start = children_start + children_len;
                             let offset_index = offset_start + child_idx * 4;
                             let next_node_offset = u32::from_le_bytes(
@@ -776,31 +840,35 @@ where
         let mut node_index = 0;
         let mut offset = 0;
 
-        while offset + 4 <= self.data.len() {
+        while offset + 2 <= self.data.len() {
             let header = unsafe { *(self.data.as_ptr().add(offset) as *const NodeHeader) };
-            let prefix_len = header.prefix_len as usize;
-            let children_len = header.children_len as usize;
+            let prefix_len = header.prefix_len() as usize;
+            let children_len = header.children_len();
 
-            let prefix_start = offset + 4;
+            let prefix_start = offset + 2;
             let prefix = &self.data[prefix_start..prefix_start + prefix_len];
 
             println!(
                 "Node[{}] @ offset {}: type={}, prefix={:?}, children={}",
-                node_index, offset, header.node_type, prefix, children_len
+                node_index,
+                offset,
+                header.node_type(),
+                prefix,
+                children_len
             );
 
             println!("  -> {children_len} children");
 
-            let children_size = match header.node_type {
-                NodeType::N48_INTERNAL => 256 + children_len * 4,
-                NodeType::N48_LEAF => 32, // 32-byte bitmap
-                NodeType::N256_INTERNAL => 256 * 4,
-                NodeType::N256_LEAF => 32, // 32-byte bitmap
+            let children_size = match header.node_type() {
+                NodeType::N48_INTERNAL => 36 + children_len * 4,
+                NodeType::N48_LEAF => 32,               // 32-byte bitmap
+                NodeType::N256_INTERNAL => 8 + 256 * 2, // slope + intercept + differences
+                NodeType::N256_LEAF => 32,              // 32-byte bitmap
                 NodeType::N4_LEAF | NodeType::N16_LEAF => children_len,
                 _ => children_len * 5, // N4/N16 internal: key + offset pairs
             };
 
-            offset += 4 + prefix_len + children_size; // header + prefix + children
+            offset += 2 + prefix_len + children_size; // header + prefix + children
             node_index += 1;
         }
 
@@ -811,25 +879,25 @@ where
         let mut count = 0;
         let mut offset = 0;
 
-        while offset + 4 <= self.data.len() {
+        while offset + 2 <= self.data.len() {
             count += 1;
 
             // Read node header to calculate size
             let header = unsafe { *(self.data.as_ptr().add(offset) as *const NodeHeader) };
-            let prefix_len = header.prefix_len as usize;
-            let children_len = header.children_len as usize;
+            let prefix_len = header.prefix_len() as usize;
+            let children_len = header.children_len();
 
             // Calculate children size based on node type
-            let children_size = match header.node_type {
-                NodeType::N48_INTERNAL => 256 + children_len * 4,
-                NodeType::N48_LEAF => 32, // 32-byte bitmap
-                NodeType::N256_INTERNAL => 256 * 4,
-                NodeType::N256_LEAF => 32, // 32-byte bitmap
+            let children_size = match header.node_type() {
+                NodeType::N48_INTERNAL => 36 + children_len * 4,
+                NodeType::N48_LEAF => 32,               // 32-byte bitmap
+                NodeType::N256_INTERNAL => 8 + 256 * 2, // slope + intercept + differences
+                NodeType::N256_LEAF => 32,              // 32-byte bitmap
                 NodeType::N4_LEAF | NodeType::N16_LEAF => children_len,
                 _ => children_len * 5, // key + offset pairs
             };
 
-            offset += 4 + prefix_len + children_size;
+            offset += 2 + prefix_len + children_size;
         }
 
         count
@@ -884,16 +952,16 @@ where
         };
 
         let mut offset = 0;
-        while offset + 4 <= self.data.len() {
+        while offset + 2 <= self.data.len() {
             let header = *self.get_node_header(offset);
             let prefix = self.get_node_prefix(offset);
-            let children_len = header.children_len as usize;
+            let children_len = header.children_len();
 
-            stats.header_bytes += 4;
+            stats.header_bytes += 2;
 
             stats.prefix_bytes += prefix.len();
 
-            match header.node_type {
+            match header.node_type() {
                 NodeType::N4_LEAF => {
                     stats.n4_leaf_count += 1;
                     stats.children_bytes += children_len; // 1 byte per child
@@ -926,33 +994,33 @@ where
                 }
                 NodeType::N48_INTERNAL => {
                     stats.n48_internal_count += 1;
-                    stats.children_bytes += 256 + children_len * 4; // 256 key array + 4 bytes per child offset
+                    stats.children_bytes += 36 + children_len * 4; // 4-byte precomputed + 32-byte bitmap + 4 bytes per child offset
                     stats.total_children += children_len;
                 }
                 NodeType::N256_INTERNAL => {
                     stats.n256_internal_count += 1;
-                    stats.children_bytes += 256 * 4; // 256 * 4 bytes direct offsets
+                    stats.children_bytes += 8 + 256 * 2; // slope + intercept + differences
                     stats.total_children += children_len;
                 }
                 _ => {}
             }
 
             if matches!(
-                header.node_type,
+                header.node_type(),
                 NodeType::N4_LEAF | NodeType::N16_LEAF | NodeType::N48_LEAF | NodeType::N256_LEAF
             ) {
                 stats.kv_pairs += children_len;
             }
 
-            let children_size = match header.node_type {
-                NodeType::N48_INTERNAL => 256 + children_len * 4,
-                NodeType::N48_LEAF => 32, // 32-byte bitmap
-                NodeType::N256_INTERNAL => 256 * 4,
-                NodeType::N256_LEAF => 32, // 32-byte bitmap
+            let children_size = match header.node_type() {
+                NodeType::N48_INTERNAL => 36 + children_len * 4,
+                NodeType::N48_LEAF => 32,               // 32-byte bitmap
+                NodeType::N256_INTERNAL => 8 + 256 * 2, // slope + intercept + differences
+                NodeType::N256_LEAF => 32,              // 32-byte bitmap
                 NodeType::N4_LEAF | NodeType::N16_LEAF => children_len,
                 _ => children_len * 5, // key + offset pairs
             };
-            offset += 4 + prefix.len() + children_size;
+            offset += 2 + prefix.len() + children_size;
         }
 
         #[cfg(feature = "access-stats")]

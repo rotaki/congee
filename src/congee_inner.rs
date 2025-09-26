@@ -668,15 +668,15 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
             node_offsets.push(current_offset);
 
             // Calculate node size: header + prefix + children
-            let header_size = 4; // NodeHeader
+            let header_size = 2;
             let prefix_size = node_prefix.len();
             let children_size = match *node_type {
-                CompactNodeType::N48_INTERNAL => 256 + children.len() * 4, // key array + child indices
-                CompactNodeType::N48_LEAF => 32,                           // presence array only
-                CompactNodeType::N256_INTERNAL => 256 * 4,                 // direct node indices
-                CompactNodeType::N256_LEAF => 32,                          // presence array
+                CompactNodeType::N48_INTERNAL => 36 + children.len() * 4, // precomputed (4) + bitmap (32) + child offsets
+                CompactNodeType::N48_LEAF => 32,                          // presence array only
+                CompactNodeType::N256_INTERNAL => 8 + 256 * 2, // slope + intercept + differences
+                CompactNodeType::N256_LEAF => 32,              // presence array
                 CompactNodeType::N4_LEAF | CompactNodeType::N16_LEAF => children.len(), // keys only
-                _ => children.len() * 5,                                   // key + offset pairs
+                _ => children.len() * 5,                       // key + offset pairs
             };
 
             current_offset += header_size + prefix_size + children_size;
@@ -685,9 +685,11 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
         // Second pass: serialize all nodes, replace indices with actual offsets
         for (node_type, node_prefix, children, is_leaf) in nodes_data.into_iter() {
             // Write node header
-            buf.push(node_type);
-            buf.push(node_prefix.len() as u8);
-            buf.extend_from_slice(&(children.len() as u16).to_le_bytes());
+            use crate::congee_compact_set::NodeHeader;
+            let type_and_prefix =
+                NodeHeader::pack_type_and_prefix(node_type, node_prefix.len() as u8);
+            buf.push(type_and_prefix);
+            buf.push((children.len() - 1) as u8);
 
             // Write prefix
             buf.extend_from_slice(&node_prefix);
@@ -695,12 +697,14 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
             // Write children based on node type
             match node_type {
                 CompactNodeType::N48_INTERNAL => {
-                    // N48 Internal: 256-byte key array + child offset array
-                    let mut key_array = [0u8; 256]; // 0 means not present
+                    // N48 Internal: [precomputed popcounts][256-bit bitmap][child offsets]
+                    use crate::utils::{compute_precomputed_popcounts, set_bit};
+
+                    let mut bitmap = [0u8; 32]; // 256 bits = 32 bytes
                     let mut child_offsets = Vec::new();
 
                     for (key, node_index_opt) in children {
-                        key_array[key as usize] = (child_offsets.len() + 1) as u8; // 1-based index into child_offsets
+                        set_bit(&mut bitmap, key); // Set bit for this key
                         let offset = if let Some(idx) = node_index_opt {
                             node_offsets[idx as usize] as u32
                         } else {
@@ -709,8 +713,17 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                         child_offsets.push(offset);
                     }
 
-                    // Write key array (256 bytes)
-                    buf.extend_from_slice(&key_array);
+                    // Compute precomputed popcount values
+                    let precomputed = compute_precomputed_popcounts(&bitmap);
+
+                    // Write precomputed popcount values (4 bytes: 4 * u8)
+                    for &count in &precomputed {
+                        buf.extend_from_slice(&count.to_le_bytes());
+                    }
+
+                    // Write bitmap (32 bytes)
+                    buf.extend_from_slice(&bitmap);
+
                     // Write child offsets (4 bytes each)
                     for &offset in &child_offsets {
                         buf.extend_from_slice(&offset.to_le_bytes());
@@ -730,7 +743,9 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                     buf.extend_from_slice(&bitmap);
                 }
                 CompactNodeType::N256_INTERNAL => {
-                    // N256 Internal: 256 x 4-byte direct node offsets
+                    // N256 Internal: Uses the concept of straight lines to compress the offsets.
+                    // The line is defined by a slope and intercept. The difference is the actual offset minus the predicted offset.
+                    // [slope: u32][intercept: u32][differences: 256 * i16]
                     let mut direct_children = [0u32; 256];
 
                     for (key, node_index_opt) in children {
@@ -742,9 +757,34 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                         direct_children[key as usize] = offset;
                     }
 
-                    // Write direct offsets (1024 bytes)
-                    for &offset in &direct_children {
-                        buf.extend_from_slice(&offset.to_le_bytes());
+                    // Calculate linear compression parameters
+                    let non_zero_offsets: Vec<u32> = direct_children
+                        .iter()
+                        .filter(|&x| *x != 0)
+                        .cloned()
+                        .collect();
+
+                    let min_offset = *non_zero_offsets.iter().min().unwrap();
+                    let max_offset = *non_zero_offsets.iter().max().unwrap();
+
+                    let slope = (max_offset - min_offset) / 255;
+                    let intercept = min_offset;
+
+                    // Write slope and intercept
+                    buf.extend_from_slice(&slope.to_le_bytes());
+                    buf.extend_from_slice(&intercept.to_le_bytes());
+
+                    // Calculate and write difference array
+                    // Use i16::MIN as sentinel value for "no child"
+                    for (i, child) in direct_children.iter().enumerate() {
+                        let difference = if *child != 0 {
+                            let predicted = slope * i as u32 + intercept;
+                            let diff = *child as i32 - predicted as i32;
+                            diff as i16
+                        } else {
+                            i16::MIN
+                        };
+                        buf.extend_from_slice(&difference.to_le_bytes());
                     }
                 }
                 CompactNodeType::N256_LEAF => {
