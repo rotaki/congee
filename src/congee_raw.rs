@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::{Allocator, CongeeInner, DefaultAllocator, epoch, error::OOMError, stats};
+use crate::{Allocator, CongeeInner, DefaultAllocator, NodeView, epoch, error::OOMError, stats};
 
 /// The adaptive radix tree.
 pub struct CongeeRaw<
@@ -49,6 +49,47 @@ where
         let key: [u8; 8] = key.to_be_bytes();
         let v = self.inner.get(&key, guard)?;
         Some(V::from(v))
+    }
+
+    /// Read-only apply under an optimistic read snapshot.
+    ///
+    /// Returns `None` if the key is absent. If present, invokes `f` with the
+    /// payload and returns `Some(f(value))`.
+    ///
+    /// Like [`CongeeRaw::get`], this does not take an exclusive lock on the leaf.
+    /// Under contention, the closure may be invoked more than once before a
+    /// version-stable read completes, so it must be safe to retry.
+    #[inline]
+    pub fn get_apply<F, R>(&self, key: &K, mut f: F, guard: &epoch::Guard) -> Option<R>
+    where
+        F: FnMut(usize) -> R,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner.get_apply(&key, &mut f, guard)
+    }
+
+    /// Like [`CongeeRaw::get_apply`], but also exposes sibling payloads in the
+    /// same leaf node via [`NodeView`].
+    ///
+    /// `view.siblings_after()` starts at the next byte after the matched one,
+    /// does not wrap past `0xFF`, and skips sub-node children.
+    ///
+    /// The sibling view is checked against the node version after the closure
+    /// returns. Under contention, the closure may be retried.
+    #[inline]
+    pub fn get_apply_with_siblings<F, R>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &NodeView<'_>) -> R,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner.get_apply_with_siblings(&key, &mut f, guard)
     }
 
     /// Enters an epoch.
@@ -228,7 +269,8 @@ where
     /// Returns the (old, new) value
     ///
     /// Note that the function `f` is a FnMut and it must be safe to execute multiple times.
-    /// The `f` is expected to be short and fast as it will hold a exclusive lock on the leaf node.
+    /// The closure runs under an optimistic read snapshot and may be retried before
+    /// any update is committed.
     ///
     /// # Examples
     ///

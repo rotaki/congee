@@ -6,6 +6,9 @@ use std::thread;
 
 use crate::congee_inner::CongeeInner;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::CongeeRaw;
 
 #[test]
 fn small_insert() {
@@ -45,6 +48,87 @@ fn test_get_keys() {
     }
 
     assert_eq!(values, values_from_keys);
+}
+
+#[test]
+fn test_get_apply_absent() {
+    let tree = CongeeRaw::<usize, usize>::default();
+    let guard = tree.pin();
+    let called = AtomicUsize::new(0);
+
+    let result = tree.get_apply(
+        &0x101,
+        |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            1
+        },
+        &guard,
+    );
+
+    assert_eq!(result, None);
+    assert_eq!(called.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_get_apply_nested_option() {
+    let tree = CongeeRaw::<usize, usize>::default();
+    let guard = tree.pin();
+
+    tree.insert(0x101, 11, &guard).unwrap();
+
+    let result = tree.get_apply(&0x101, |_frame_id| None::<usize>, &guard);
+
+    assert_eq!(result, Some(None));
+}
+
+#[test]
+fn test_get_apply_with_siblings() {
+    let tree = CongeeRaw::<usize, usize>::default();
+    let guard = tree.pin();
+
+    tree.insert(0x100, 1000, &guard).unwrap();
+    tree.insert(0x101, 1001, &guard).unwrap();
+    tree.insert(0x102, 1002, &guard).unwrap();
+    tree.insert(0x103, 1003, &guard).unwrap();
+
+    let result = tree.get_apply_with_siblings(
+        &0x101,
+        |frame_id, view| {
+            (
+                frame_id,
+                view.target_byte(),
+                view.siblings_after().collect::<Vec<_>>(),
+            )
+        },
+        &guard,
+    );
+
+    assert_eq!(result, Some((1001, 0x01, vec![(0x02, 1002), (0x03, 1003)])));
+}
+
+#[test]
+fn test_get_apply_with_siblings_boundary() {
+    let tree = CongeeRaw::<usize, usize>::default();
+    let guard = tree.pin();
+
+    tree.insert(0x1fe, 0x1fe0, &guard).unwrap();
+    tree.insert(0x1ff, 0x1ff0, &guard).unwrap();
+
+    let result = tree.get_apply_with_siblings(
+        &0x1fe,
+        |_frame_id, view| view.siblings_after().collect::<Vec<_>>(),
+        &guard,
+    );
+
+    assert_eq!(result, Some(vec![(0xff, 0x1ff0)]));
+
+    let no_wrap = tree.get_apply_with_siblings(
+        &0x1ff,
+        |_frame_id, view| view.siblings_after().collect::<Vec<_>>(),
+        &guard,
+    );
+
+    assert_eq!(no_wrap, Some(Vec::new()));
 }
 
 #[test]

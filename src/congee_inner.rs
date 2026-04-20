@@ -3,7 +3,7 @@ use std::{marker::PhantomData, ptr::NonNull, sync::Arc};
 use crossbeam_epoch::Guard;
 
 use crate::{
-    Allocator, DefaultAllocator, cast_ptr,
+    Allocator, DefaultAllocator, NodeView, cast_ptr,
     error::{ArtError, OOMError},
     lock::ReadGuard,
     nodes::{BaseNode, ChildIsPayload, ChildIsSubNode, Node, Node4, NodePtr, NodeType, Parent},
@@ -167,6 +167,132 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                         };
                     }
                 });
+            }
+        }
+    }
+
+    #[inline]
+    fn get_apply_inner<F, R>(
+        &self,
+        key: &[u8; K_LEN],
+        f: &mut F,
+        _guard: &Guard,
+    ) -> Result<Option<R>, ArtError>
+    where
+        F: FnMut(usize) -> R,
+    {
+        let mut level = 0;
+        let root = self.load_root();
+        let mut node = BaseNode::read_lock(root)?;
+
+        loop {
+            level = if let Some(v) = node.as_ref().check_prefix(key, level) {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            let node_key = key[level];
+            let child_node = node.as_ref().get_child(node_key);
+            node.check_version()?;
+
+            let child_node = if let Some(v) = child_node {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            cast_ptr!(child_node => {
+                Payload(tid) => {
+                    let result = f(tid);
+                    node.check_version()?;
+                    return Ok(Some(result));
+                },
+                SubNode(sub_node) => {
+                    level += 1;
+                    node = BaseNode::read_lock(sub_node)?;
+                }
+            });
+        }
+    }
+
+    #[inline]
+    fn get_apply_with_siblings_inner<F, R>(
+        &self,
+        key: &[u8; K_LEN],
+        f: &mut F,
+        _guard: &Guard,
+    ) -> Result<Option<R>, ArtError>
+    where
+        F: FnMut(usize, &NodeView<'_>) -> R,
+    {
+        let mut level = 0;
+        let root = self.load_root();
+        let mut node = BaseNode::read_lock(root)?;
+
+        loop {
+            level = if let Some(v) = node.as_ref().check_prefix(key, level) {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            let node_key = key[level];
+            let child_node = node.as_ref().get_child(node_key);
+            node.check_version()?;
+
+            let child_node = if let Some(v) = child_node {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            cast_ptr!(child_node => {
+                Payload(tid) => {
+                    let result = {
+                        let view = NodeView::new(node.as_ref(), node_key);
+                        f(tid, &view)
+                    };
+                    node.check_version()?;
+                    return Ok(Some(result));
+                },
+                SubNode(sub_node) => {
+                    level += 1;
+                    node = BaseNode::read_lock(sub_node)?;
+                }
+            });
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_apply_with_siblings<F, R>(
+        &self,
+        key: &[u8; K_LEN],
+        f: &mut F,
+        guard: &Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &NodeView<'_>) -> R,
+    {
+        let backoff = Backoff::new();
+        loop {
+            match self.get_apply_with_siblings_inner(key, f, guard) {
+                Ok(result) => return result,
+                Err(_) => backoff.spin(),
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_apply<F, R>(&self, key: &[u8; K_LEN], f: &mut F, guard: &Guard) -> Option<R>
+    where
+        F: FnMut(usize) -> R,
+    {
+        let backoff = Backoff::new();
+        loop {
+            match self.get_apply_inner(key, f, guard) {
+                Ok(result) => return result,
+                Err(_) => backoff.spin(),
             }
         }
     }
