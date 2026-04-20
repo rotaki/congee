@@ -596,6 +596,358 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
         }
     }
 
+    // Keep in sync with compute_if_present_inner above.
+    #[inline]
+    fn compute_if_present_with_siblings_inner<F>(
+        &self,
+        k: &[u8; K_LEN],
+        remapping_function: &mut F,
+        guard: &Guard,
+    ) -> Result<Option<(usize, Option<usize>)>, ArtError>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let mut parent: Option<(ReadGuard, u8)> = None;
+        let mut node_key: u8;
+        let mut level = 0;
+        let root = self.load_root();
+        let mut node = BaseNode::read_lock(root)?;
+
+        loop {
+            level = if let Some(v) = node.as_ref().check_prefix(k, level) {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            node_key = k[level];
+
+            let child_node = node.as_ref().get_child(node_key);
+            node.check_version()?;
+
+            let child_node = match child_node {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+
+            cast_ptr!(child_node => {
+                Payload(tid) => {
+                    let view = crate::NodeView::new(node.as_ref(), node_key);
+                    let new_v = remapping_function(tid, &view);
+
+                    match new_v {
+                        Some(new_v) => {
+                            if new_v == tid {
+                                // the value is not change, early return;
+                                return Ok(Some((tid, Some(tid))));
+                            }
+                            let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
+                            write_n
+                                .as_mut()
+                                .change(k[level], NodePtr::from_payload(new_v));
+
+                            return Ok(Some((tid, Some(new_v))));
+                        }
+                        None => {
+                            debug_assert!(parent.is_some());
+                            if node.as_ref().value_count() == 1 {
+                                let (parent_node, parent_key) = parent.unwrap();
+                                let mut write_p = parent_node.upgrade().map_err(|(_n, v)| v)?;
+
+                                let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
+
+                                write_p.as_mut().remove(parent_key);
+
+                                write_n.mark_obsolete();
+                                let allocator = self.allocator.clone();
+                                guard.defer(move || unsafe {
+                                    let ptr = NonNull::from(write_n.as_mut());
+                                    std::mem::forget(write_n);
+                                    BaseNode::drop_node(ptr, allocator);
+                                });
+                            } else {
+                                let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
+
+                                write_n.as_mut().remove(node_key);
+                            }
+                            return Ok(Some((tid, None)));
+                        }
+                    }
+                },
+                SubNode(sub_node) => {
+                    level += 1;
+                    parent = Some((node, node_key));
+                    node = BaseNode::read_lock(sub_node)?;
+                }
+            });
+        }
+    }
+
+    #[inline]
+    pub(crate) fn compute_if_present_with_siblings<F>(
+        &self,
+        k: &[u8; K_LEN],
+        remapping_function: &mut F,
+        guard: &Guard,
+    ) -> Option<(usize, Option<usize>)>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let backoff = Backoff::new();
+        loop {
+            match self.compute_if_present_with_siblings_inner(k, &mut *remapping_function, guard) {
+                Ok(n) => return n,
+                Err(_) => backoff.spin(),
+            }
+        }
+    }
+
+    // Keep in sync with `get` above.
+    #[inline]
+    pub(crate) fn get_with_siblings<F, R>(
+        &self,
+        key: &[u8; K_LEN],
+        f: &mut F,
+        _guard: &Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> R,
+    {
+        'outer: loop {
+            let mut level = 0;
+
+            let root = self.load_root();
+            let mut node = if let Ok(v) = BaseNode::read_lock(root) {
+                v
+            } else {
+                continue;
+            };
+
+            loop {
+                level = node.as_ref().check_prefix(key, level)?;
+
+                let node_key = unsafe { *key.get_unchecked(level) };
+                let child_node = node.as_ref().get_child(node_key);
+                if node.check_version().is_err() {
+                    continue 'outer;
+                }
+
+                let child_node = child_node?;
+
+                cast_ptr!(child_node => {
+                    Payload(tid) => {
+                        let view = crate::NodeView::new(node.as_ref(), node_key);
+                        let result = f(tid, &view);
+                        if node.check_version().is_err() {
+                            continue 'outer;
+                        }
+                        return Some(result);
+                    },
+                    SubNode(sub_node) => {
+                        level += 1;
+
+                        node = if let Ok(n) = BaseNode::read_lock(sub_node) {
+                            n
+                        } else {
+                            continue 'outer;
+                        };
+                    }
+                });
+            }
+        }
+    }
+
+    // Like `get_with_siblings`, but holds a real exclusive lock on the target
+    // leaf across the closure. Closure is invoked exactly once on the
+    // successful path. Upgrade failures retry the traversal BEFORE calling
+    // the closure, so `FnMut` is only needed as a type-level compromise —
+    // the closure is never invoked more than once per successful call.
+    #[inline]
+    pub(crate) fn get_with_siblings_locked<F, R>(
+        &self,
+        key: &[u8; K_LEN],
+        f: &mut F,
+        _guard: &Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> R,
+    {
+        let backoff = Backoff::new();
+        'outer: loop {
+            let mut level = 0;
+            let root = self.load_root();
+            let mut node = if let Ok(v) = BaseNode::read_lock(root) {
+                v
+            } else {
+                backoff.spin();
+                continue 'outer;
+            };
+
+            loop {
+                level = node.as_ref().check_prefix(key, level)?;
+                let node_key = unsafe { *key.get_unchecked(level) };
+                let child_node = node.as_ref().get_child(node_key);
+                if node.check_version().is_err() {
+                    backoff.spin();
+                    continue 'outer;
+                }
+                let child_node = child_node?;
+
+                cast_ptr!(child_node => {
+                    Payload(tid) => {
+                        let write_n = match node.upgrade() {
+                            Ok(w) => w,
+                            Err(_) => {
+                                backoff.spin();
+                                continue 'outer;
+                            }
+                        };
+                        let view = crate::NodeView::new(write_n.as_ref(), node_key);
+                        let result = f(tid, &view);
+                        return Some(result);
+                    },
+                    SubNode(sub_node) => {
+                        level += 1;
+                        node = if let Ok(n) = BaseNode::read_lock(sub_node) {
+                            n
+                        } else {
+                            backoff.spin();
+                            continue 'outer;
+                        };
+                    }
+                });
+            }
+        }
+    }
+
+    // Keep in sync with compute_if_present_with_siblings_inner (Phase 1
+    // optimistic variant). This locked variant upgrades to WriteGuard BEFORE
+    // calling the closure. If the leaf has `value_count == 1`, the parent
+    // write-lock is also acquired before the closure so that the rare
+    // delete-last-value path is atomic — closure runs exactly once in all
+    // cases on the successful path. Upgrade failures before the closure
+    // trigger outer retry.
+    #[inline]
+    fn compute_if_present_locked_inner<F>(
+        &self,
+        k: &[u8; K_LEN],
+        remapping_function: &mut F,
+        guard: &Guard,
+    ) -> Result<Option<(usize, Option<usize>)>, ArtError>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let mut parent: Option<(ReadGuard, u8)> = None;
+        let mut node_key: u8;
+        let mut level = 0;
+        let root = self.load_root();
+        let mut node = BaseNode::read_lock(root)?;
+
+        loop {
+            level = if let Some(v) = node.as_ref().check_prefix(k, level) {
+                v
+            } else {
+                return Ok(None);
+            };
+
+            node_key = k[level];
+
+            let child_node = node.as_ref().get_child(node_key);
+            node.check_version()?;
+
+            let child_node = match child_node {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+
+            cast_ptr!(child_node => {
+                Payload(tid) => {
+                    let value_count = node.as_ref().value_count();
+                    node.check_version()?;
+
+                    if value_count == 1 {
+                        // Delete-last-value possible. Pre-acquire parent
+                        // write-lock so that the whole op (update or
+                        // delete) is atomic under both locks.
+                        debug_assert!(parent.is_some());
+                        let (parent_node, parent_key) = parent.unwrap();
+                        let mut write_p = parent_node.upgrade().map_err(|(_n, v)| v)?;
+                        let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
+                        let view = crate::NodeView::new(write_n.as_ref(), node_key);
+                        let new_v = remapping_function(tid, &view);
+
+                        match new_v {
+                            Some(new_v) => {
+                                if new_v != tid {
+                                    write_n.as_mut().change(k[level], NodePtr::from_payload(new_v));
+                                }
+                                // write_p drops here (parent lock wasn't needed
+                                // because closure returned Some). Slight waste
+                                // in this edge case but keeps semantics clean.
+                                drop(write_p);
+                                return Ok(Some((tid, Some(new_v))));
+                            }
+                            None => {
+                                write_p.as_mut().remove(parent_key);
+                                write_n.mark_obsolete();
+                                let allocator = self.allocator.clone();
+                                guard.defer(move || unsafe {
+                                    let ptr = NonNull::from(write_n.as_mut());
+                                    std::mem::forget(write_n);
+                                    BaseNode::drop_node(ptr, allocator);
+                                });
+                                return Ok(Some((tid, None)));
+                            }
+                        }
+                    } else {
+                        // value_count > 1: leaf lock alone is enough for
+                        // both update and delete.
+                        let mut write_n = node.upgrade().map_err(|(_n, v)| v)?;
+                        let view = crate::NodeView::new(write_n.as_ref(), node_key);
+                        let new_v = remapping_function(tid, &view);
+
+                        match new_v {
+                            Some(new_v) => {
+                                if new_v != tid {
+                                    write_n.as_mut().change(k[level], NodePtr::from_payload(new_v));
+                                }
+                                return Ok(Some((tid, Some(new_v))));
+                            }
+                            None => {
+                                write_n.as_mut().remove(node_key);
+                                return Ok(Some((tid, None)));
+                            }
+                        }
+                    }
+                },
+                SubNode(sub_node) => {
+                    level += 1;
+                    parent = Some((node, node_key));
+                    node = BaseNode::read_lock(sub_node)?;
+                }
+            });
+        }
+    }
+
+    #[inline]
+    pub(crate) fn compute_if_present_locked_with_siblings<F>(
+        &self,
+        k: &[u8; K_LEN],
+        remapping_function: &mut F,
+        guard: &Guard,
+    ) -> Option<(usize, Option<usize>)>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let backoff = Backoff::new();
+        loop {
+            match self.compute_if_present_locked_inner(k, &mut *remapping_function, guard) {
+                Ok(n) => return n,
+                Err(_) => backoff.spin(),
+            }
+        }
+    }
+
     pub(crate) fn allocator(&self) -> &A {
         &self.allocator
     }

@@ -10,6 +10,7 @@ mod congee_raw;
 mod congee_set;
 mod error;
 mod lock;
+mod node_view;
 mod nodes;
 mod range_scan;
 mod stats;
@@ -24,8 +25,9 @@ pub mod epoch {
     pub use crossbeam_epoch::{Guard, pin};
 }
 
-pub use congee::Congee;
+pub use congee::{Congee, NodeViewArc, SiblingIterArc};
 pub use congee_compact_set::{CompactSetStats, CongeeCompactSet};
 pub use congee_raw::CongeeRaw;
 pub use congee_set::CongeeSet;
+pub use node_view::{NodeView, SiblingIter};
 pub use utils::{Allocator, DefaultAllocator, MemoryStatsAllocator};

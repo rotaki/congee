@@ -1,6 +1,63 @@
 use std::{marker::PhantomData, ptr::with_exposed_provenance, sync::Arc};
 
-use crate::{CongeeInner, DefaultAllocator, epoch, error::OOMError};
+use crate::{CongeeInner, DefaultAllocator, NodeView, SiblingIter, epoch, error::OOMError};
+
+/// `Arc<V>`-typed view of the ART inner node holding the target key during a
+/// [`Congee::compute_if_present_with_siblings`] or
+/// [`Congee::get_with_siblings`] call. Wraps a [`NodeView`] and surfaces
+/// siblings as `Arc<V>` using the same refcount management as the rest of
+/// [`Congee`].
+pub struct NodeViewArc<'a, V> {
+    inner: &'a NodeView<'a>,
+    _pt: PhantomData<fn() -> V>,
+}
+
+impl<'a, V> NodeViewArc<'a, V> {
+    fn new(inner: &'a NodeView<'a>) -> Self {
+        Self {
+            inner,
+            _pt: PhantomData,
+        }
+    }
+
+    /// Byte slot of the target key in this node (i.e. `k[level]`).
+    pub fn target_byte(&self) -> u8 {
+        self.inner.target_byte()
+    }
+
+    /// Forward iterator over sibling `(byte, Arc<V>)` entries in the same
+    /// node, starting at `target_byte + 1`. See [`NodeView::siblings_after`]
+    /// for details. Each yielded `Arc<V>` is a new strong reference.
+    pub fn siblings_after(&self) -> SiblingIterArc<'_, V> {
+        SiblingIterArc {
+            inner: self.inner.siblings_after(),
+            _pt: PhantomData,
+        }
+    }
+}
+
+/// Iterator yielded by [`NodeViewArc::siblings_after`]. Yields
+/// `(byte, Arc<V>)` pairs in ascending byte order, reconstructing each
+/// `Arc<V>` from the payload pointer with a refcount bump.
+pub struct SiblingIterArc<'a, V> {
+    inner: SiblingIter<'a>,
+    _pt: PhantomData<fn() -> V>,
+}
+
+impl<'a, V> Iterator for SiblingIterArc<'a, V> {
+    type Item = (u8, Arc<V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (byte, tid) = self.inner.next()?;
+        // Safety
+        // The pointer was previously inserted with expose_provenance.
+        // The held epoch::Guard keeps the backing memory alive.
+        let owned = unsafe { arc_from_usize::<V>(tid) };
+        let rt = owned.clone();
+        _ = Arc::into_raw(owned);
+        Some((byte, rt))
+    }
+}
 
 /// A concurrent map-like data structure that uses Arc for reference counting of values.
 ///
@@ -278,6 +335,192 @@ where
             }
         };
         let (old, _new) = self.inner.compute_if_present(&key, &mut inner_f, guard)?;
+        let old_owned = unsafe { arc_from_usize::<V>(old) };
+        let delayed_v = old_owned.clone();
+        guard.defer(move || {
+            drop(delayed_v);
+        });
+        Some(old_owned)
+    }
+
+    /// Like [`Self::compute_if_present`], but `f` additionally receives a
+    /// [`NodeViewArc`] exposing a forward iterator over sibling `(byte, Arc<V>)`
+    /// entries in the same ART inner node. See
+    /// [`CongeeRaw::compute_if_present_with_siblings`](crate::CongeeRaw::compute_if_present_with_siblings)
+    /// for the concurrency contract.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::Congee;
+    /// use std::sync::Arc;
+    ///
+    /// let tree: Congee<usize, String> = Congee::new();
+    /// let guard = tree.pin();
+    ///
+    /// for i in 0x100..=0x103usize {
+    ///     tree.insert(i, Arc::new(format!("v{i}")), &guard).unwrap();
+    /// }
+    ///
+    /// let old = tree.compute_if_present_with_siblings(
+    ///     0x101,
+    ///     |v, view| {
+    ///         let names: Vec<_> = view.siblings_after().map(|(b, a)| (b, (*a).clone())).collect();
+    ///         assert_eq!(names, vec![
+    ///             (0x02, String::from("v258")),
+    ///             (0x03, String::from("v259")),
+    ///         ]);
+    ///         Some(Arc::new(format!("{v}!")))
+    ///     },
+    ///     &guard,
+    /// ).unwrap();
+    /// assert_eq!(old.as_ref(), "v257");
+    /// ```
+    pub fn compute_if_present_with_siblings<F>(
+        &self,
+        key: K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<Arc<V>>
+    where
+        F: FnMut(Arc<V>, &NodeViewArc<'_, V>) -> Option<Arc<V>>,
+    {
+        let usize_key: usize = usize::from(key);
+        let key: [u8; 8] = usize_key.to_be_bytes();
+        let mut inner_f = |v: usize, view: &crate::NodeView<'_>| {
+            // Safety
+            // The pointer was previously inserted with expose_provenance
+            let owned = unsafe { arc_from_usize::<V>(v) };
+            let owned_clone = owned.clone();
+            let view_arc = NodeViewArc::<V>::new(view);
+            let rt = f(owned_clone, &view_arc);
+            _ = Arc::into_raw(owned);
+            if let Some(new) = rt {
+                let new_v = Arc::into_raw(new);
+                Some(new_v.expose_provenance())
+            } else {
+                None
+            }
+        };
+        let (old, _new) = self
+            .inner
+            .compute_if_present_with_siblings(&key, &mut inner_f, guard)?;
+        let old_owned = unsafe { arc_from_usize::<V>(old) };
+        let delayed_v = old_owned.clone();
+        guard.defer(move || {
+            drop(delayed_v);
+        });
+        Some(old_owned)
+    }
+
+    /// Read-only lookup that exposes sibling `(byte, Arc<V>)` entries in the
+    /// target's ART inner node to the closure. See
+    /// [`CongeeRaw::get_with_siblings`](crate::CongeeRaw::get_with_siblings)
+    /// for the concurrency contract.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::Congee;
+    /// use std::sync::Arc;
+    ///
+    /// let tree: Congee<usize, String> = Congee::new();
+    /// let guard = tree.pin();
+    ///
+    /// for i in 0x100..=0x103usize {
+    ///     tree.insert(i, Arc::new(format!("v{i}")), &guard).unwrap();
+    /// }
+    ///
+    /// let got = tree.get_with_siblings(0x101, |v, view| {
+    ///     let mut bytes: Vec<u8> = view.siblings_after().map(|(b, _a)| b).collect();
+    ///     bytes.sort();
+    ///     (v.as_ref().clone(), bytes)
+    /// }, &guard);
+    /// assert_eq!(got, Some((String::from("v257"), vec![0x02, 0x03])));
+    /// ```
+    pub fn get_with_siblings<F, R>(&self, key: K, mut f: F, guard: &epoch::Guard) -> Option<R>
+    where
+        F: FnMut(Arc<V>, &NodeViewArc<'_, V>) -> R,
+    {
+        let usize_key: usize = usize::from(key);
+        let key: [u8; 8] = usize_key.to_be_bytes();
+        let mut inner_f = |v: usize, view: &crate::NodeView<'_>| {
+            // Safety
+            // The pointer was previously inserted with expose_provenance
+            let owned = unsafe { arc_from_usize::<V>(v) };
+            let owned_clone = owned.clone();
+            let view_arc = NodeViewArc::<V>::new(view);
+            let rt = f(owned_clone, &view_arc);
+            _ = Arc::into_raw(owned);
+            rt
+        };
+        self.inner.get_with_siblings(&key, &mut inner_f, guard)
+    }
+
+    /// Like [`Self::get_with_siblings`], but the closure runs under a real
+    /// exclusive lock on the target leaf node. Invoked exactly once per
+    /// successful call. See
+    /// [`CongeeRaw::get_with_siblings_locked`](crate::CongeeRaw::get_with_siblings_locked)
+    /// for full concurrency/deadlock details.
+    pub fn get_with_siblings_locked<F, R>(
+        &self,
+        key: K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(Arc<V>, &NodeViewArc<'_, V>) -> R,
+    {
+        let usize_key: usize = usize::from(key);
+        let key: [u8; 8] = usize_key.to_be_bytes();
+        let mut inner_f = |v: usize, view: &crate::NodeView<'_>| {
+            // Safety
+            // The pointer was previously inserted with expose_provenance
+            let owned = unsafe { arc_from_usize::<V>(v) };
+            let owned_clone = owned.clone();
+            let view_arc = NodeViewArc::<V>::new(view);
+            let rt = f(owned_clone, &view_arc);
+            _ = Arc::into_raw(owned);
+            rt
+        };
+        self.inner
+            .get_with_siblings_locked(&key, &mut inner_f, guard)
+    }
+
+    /// Like [`Self::compute_if_present_with_siblings`], but the closure runs
+    /// under a real exclusive lock on the target leaf node. Invoked exactly
+    /// once per successful call. See
+    /// [`CongeeRaw::compute_if_present_locked_with_siblings`](crate::CongeeRaw::compute_if_present_locked_with_siblings)
+    /// for full concurrency/deadlock details.
+    pub fn compute_if_present_locked_with_siblings<F>(
+        &self,
+        key: K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<Arc<V>>
+    where
+        F: FnMut(Arc<V>, &NodeViewArc<'_, V>) -> Option<Arc<V>>,
+    {
+        let usize_key: usize = usize::from(key);
+        let key: [u8; 8] = usize_key.to_be_bytes();
+        let mut inner_f = |v: usize, view: &crate::NodeView<'_>| {
+            // Safety
+            // The pointer was previously inserted with expose_provenance
+            let owned = unsafe { arc_from_usize::<V>(v) };
+            let owned_clone = owned.clone();
+            let view_arc = NodeViewArc::<V>::new(view);
+            let rt = f(owned_clone, &view_arc);
+            _ = Arc::into_raw(owned);
+            if let Some(new) = rt {
+                let new_v = Arc::into_raw(new);
+                Some(new_v.expose_provenance())
+            } else {
+                None
+            }
+        };
+        let (old, _new) = self
+            .inner
+            .compute_if_present_locked_with_siblings(&key, &mut inner_f, guard)?;
         let old_owned = unsafe { arc_from_usize::<V>(old) };
         let delayed_v = old_owned.clone();
         guard.defer(move || {
@@ -733,6 +976,158 @@ mod tests {
         let result = tree.compute_if_present(1, |_| Some(Arc::new(String::from("new"))), &guard);
         assert!(result.is_none());
         assert!(tree.get(1, &guard).is_none());
+    }
+
+    #[test]
+    fn test_compute_if_present_with_siblings_arc() {
+        let tree: Congee<usize, String> = Congee::new();
+        let guard = tree.pin();
+
+        let stored: Vec<Arc<String>> = (0x100..=0x103usize)
+            .map(|i| Arc::new(format!("v{i}")))
+            .collect();
+        for (i, v) in (0x100..=0x103usize).zip(stored.iter()) {
+            tree.insert(i, v.clone(), &guard).unwrap();
+        }
+
+        // One strong ref in the tree + one in `stored` = 2.
+        for v in &stored {
+            assert_eq!(Arc::strong_count(v), 2);
+        }
+
+        let old = tree
+            .compute_if_present_with_siblings(
+                0x101,
+                |current, view| {
+                    assert_eq!(view.target_byte(), 0x01);
+                    let siblings: Vec<_> = view.siblings_after().collect();
+                    assert_eq!(siblings.len(), 2);
+                    assert_eq!(siblings[0].0, 0x02);
+                    assert_eq!(siblings[0].1.as_str(), "v258");
+                    assert_eq!(siblings[1].0, 0x03);
+                    assert_eq!(siblings[1].1.as_str(), "v259");
+                    Some(Arc::new(format!("{current}!")))
+                },
+                &guard,
+            )
+            .unwrap();
+        assert_eq!(old.as_ref(), "v257");
+
+        // Siblings should not have leaked a persistent strong ref.
+        // stored entries for 0x100, 0x102, 0x103 still each have 2 refs (tree + stored).
+        assert_eq!(Arc::strong_count(&stored[0]), 2);
+        assert_eq!(Arc::strong_count(&stored[2]), 2);
+        assert_eq!(Arc::strong_count(&stored[3]), 2);
+    }
+
+    #[test]
+    fn test_get_with_siblings_arc() {
+        let tree: Congee<usize, String> = Congee::new();
+        let guard = tree.pin();
+
+        let stored: Vec<Arc<String>> = (0x100..=0x103usize)
+            .map(|i| Arc::new(format!("v{i}")))
+            .collect();
+        for (i, v) in (0x100..=0x103usize).zip(stored.iter()) {
+            tree.insert(i, v.clone(), &guard).unwrap();
+        }
+
+        for v in &stored {
+            assert_eq!(Arc::strong_count(v), 2);
+        }
+
+        let got = tree
+            .get_with_siblings(
+                0x101,
+                |current, view| {
+                    let mut out = vec![(view.target_byte(), current.as_ref().clone())];
+                    for (b, a) in view.siblings_after() {
+                        out.push((b, a.as_ref().clone()));
+                    }
+                    out
+                },
+                &guard,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (0x01, String::from("v257")),
+                (0x02, String::from("v258")),
+                (0x03, String::from("v259")),
+            ],
+        );
+
+        // Reference counts restored after closure returns.
+        for v in &stored {
+            assert_eq!(Arc::strong_count(v), 2);
+        }
+    }
+
+    #[test]
+    fn test_locked_pair_arc() {
+        let tree: Congee<usize, String> = Congee::new();
+        let guard = tree.pin();
+
+        let stored: Vec<Arc<String>> = (0x100..=0x103usize)
+            .map(|i| Arc::new(format!("v{i}")))
+            .collect();
+        for (i, v) in (0x100..=0x103usize).zip(stored.iter()) {
+            tree.insert(i, v.clone(), &guard).unwrap();
+        }
+        for v in &stored {
+            assert_eq!(Arc::strong_count(v), 2);
+        }
+
+        // Locked read: closure runs once, sees stable siblings.
+        let got = tree
+            .get_with_siblings_locked(
+                0x101,
+                |v, view| {
+                    let mut out = vec![(view.target_byte(), v.as_ref().clone())];
+                    for (b, a) in view.siblings_after() {
+                        out.push((b, a.as_ref().clone()));
+                    }
+                    out
+                },
+                &guard,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (0x01, String::from("v257")),
+                (0x02, String::from("v258")),
+                (0x03, String::from("v259")),
+            ],
+        );
+        for v in &stored {
+            assert_eq!(Arc::strong_count(v), 2);
+        }
+
+        // Locked compute: closure runs once, updates the value.
+        let old = tree
+            .compute_if_present_locked_with_siblings(
+                0x101,
+                |cur, _view| Some(Arc::new(format!("{cur}!"))),
+                &guard,
+            )
+            .unwrap();
+        assert_eq!(old.as_ref(), "v257");
+        drop(old);
+        assert_eq!(tree.get(0x101, &guard).unwrap().as_ref(), "v257!");
+    }
+
+    #[test]
+    fn test_get_with_siblings_absent_arc() {
+        let tree: Congee<usize, String> = Congee::new();
+        let guard = tree.pin();
+        tree.insert(0x100, Arc::new(String::from("only")), &guard)
+            .unwrap();
+
+        let got: Option<()> =
+            tree.get_with_siblings(0x200, |_v, _view| panic!("closure must not run"), &guard);
+        assert!(got.is_none());
     }
 
     #[test]

@@ -227,8 +227,11 @@ where
     /// Compute and update the value if the key presents in the tree.
     /// Returns the (old, new) value
     ///
-    /// Note that the function `f` is a FnMut and it must be safe to execute multiple times.
-    /// The `f` is expected to be short and fast as it will hold a exclusive lock on the leaf node.
+    /// The closure runs under an optimistic read-version snapshot — it does
+    /// NOT hold any lock. On version conflict at commit time the whole
+    /// operation retries, so `f` may be invoked more than once and must be
+    /// safe to execute multiple times. The actual exclusive lock is held
+    /// only across the internal slot mutation, after `f` returns.
     ///
     /// # Examples
     ///
@@ -256,6 +259,192 @@ where
         let key = usize::from(*key);
         let key: [u8; 8] = key.to_be_bytes();
         self.inner.compute_if_present(&key, &mut f, guard)
+    }
+
+    /// Like [`Self::compute_if_present`], but `f` additionally receives a
+    /// [`NodeView`](crate::NodeView) exposing a forward iterator over
+    /// sibling payloads in the same ART inner node. Intended for reading
+    /// numerically adjacent keys without a second tree traversal.
+    ///
+    /// Same concurrency contract as [`Self::compute_if_present`]: `f` runs under
+    /// an optimistic read-version snapshot and may be invoked more than
+    /// once on contention. Sibling values yielded within a single
+    /// invocation are consistent; across retries they are re-read from a
+    /// fresh snapshot. The upgrade-CAS protects only the target slot — a
+    /// concurrent writer on a sibling will not force a retry, so sibling
+    /// values can be stale at commit time (fine for prefetch-style use).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::CongeeRaw;
+    /// let tree = CongeeRaw::default();
+    /// let guard = tree.pin();
+    ///
+    /// for i in 0x100..=0x103 {
+    ///     tree.insert(i, i * 10, &guard).unwrap();
+    /// }
+    ///
+    /// let (old, _new) = tree.compute_if_present_with_siblings(
+    ///     &0x101,
+    ///     |v, view| {
+    ///         let siblings: Vec<_> = view.siblings_after().collect();
+    ///         assert_eq!(siblings, vec![(0x02, 0x102 * 10), (0x03, 0x103 * 10)]);
+    ///         Some(v + 1)
+    ///     },
+    ///     &guard,
+    /// ).unwrap();
+    /// assert_eq!(old, 0x101 * 10);
+    /// ```
+    #[inline]
+    pub fn compute_if_present_with_siblings<F>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<(usize, Option<usize>)>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner
+            .compute_if_present_with_siblings(&key, &mut f, guard)
+    }
+
+    /// Read-only lookup that additionally exposes sibling payloads in the
+    /// target's ART inner node to the closure. If the key is present, `f`
+    /// is invoked with the payload value and a [`NodeView`](crate::NodeView)
+    /// and its return value is wrapped in `Some`. If the key is absent,
+    /// returns `None` without invoking `f`.
+    ///
+    /// Runs under an optimistic read-version snapshot. On version conflict
+    /// the traversal retries, so `f` may be invoked more than once and must
+    /// be safe to execute multiple times.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::CongeeRaw;
+    /// let tree = CongeeRaw::default();
+    /// let guard = tree.pin();
+    ///
+    /// for i in 0x100..=0x103 {
+    ///     tree.insert(i, i * 10, &guard).unwrap();
+    /// }
+    ///
+    /// let result = tree.get_with_siblings(&0x101, |v, view| {
+    ///     (v, view.siblings_after().collect::<Vec<_>>())
+    /// }, &guard);
+    /// assert_eq!(result, Some((0x101 * 10, vec![(0x02, 0x102 * 10), (0x03, 0x103 * 10)])));
+    /// ```
+    #[inline]
+    pub fn get_with_siblings<F, R>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> R,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner.get_with_siblings(&key, &mut f, guard)
+    }
+
+    /// Like [`Self::get_with_siblings`], but the closure runs under a real
+    /// exclusive lock on the target leaf node. The closure is invoked
+    /// **exactly once** per successful call. Sibling reads via
+    /// [`NodeView`](crate::NodeView) are fully consistent and remain stable
+    /// for the duration of the closure (no concurrent writer can touch this
+    /// node).
+    ///
+    /// Cost: concurrent readers and writers of the **same leaf node** block
+    /// while the closure runs. All other traversal (root → parent) remains
+    /// optimistic and is never blocked. Keep the closure short.
+    ///
+    /// **Deadlock hazard**: do not call back into this tree from inside the
+    /// closure. Any re-entrant call that needs to lock the same leaf node
+    /// will deadlock.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::CongeeRaw;
+    /// let tree = CongeeRaw::default();
+    /// let guard = tree.pin();
+    ///
+    /// for i in 0x100..=0x103 {
+    ///     tree.insert(i, i * 10, &guard).unwrap();
+    /// }
+    ///
+    /// let result = tree.get_with_siblings_locked(&0x101, |v, view| {
+    ///     (v, view.siblings_after().collect::<Vec<_>>())
+    /// }, &guard);
+    /// assert_eq!(result, Some((0x101 * 10, vec![(0x02, 0x102 * 10), (0x03, 0x103 * 10)])));
+    /// ```
+    #[inline]
+    pub fn get_with_siblings_locked<F, R>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> R,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner.get_with_siblings_locked(&key, &mut f, guard)
+    }
+
+    /// Like [`Self::compute_if_present_with_siblings`], but the closure runs
+    /// under a real exclusive lock on the target leaf node. The closure is
+    /// invoked **exactly once** per successful call.
+    ///
+    /// Locking scope: only the target leaf is locked across the closure.
+    /// All traversal from root to leaf remains optimistic. When the closure
+    /// returns `None` on the last value in the node, the parent node is also
+    /// briefly write-locked to perform the leaf removal — but the parent
+    /// lock is acquired **before** the closure runs in that case, preserving
+    /// exactly-once semantics even for delete-last-value.
+    ///
+    /// Cost: concurrent readers and writers of the target leaf block for
+    /// the duration of the closure. Keep the closure short.
+    ///
+    /// **Deadlock hazard**: do not call back into this tree from inside the
+    /// closure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use congee::CongeeRaw;
+    /// let tree = CongeeRaw::default();
+    /// let guard = tree.pin();
+    /// tree.insert(1, 42, &guard);
+    ///
+    /// let old = tree.compute_if_present_locked_with_siblings(
+    ///     &1,
+    ///     |v, _view| Some(v + 1),
+    ///     &guard,
+    /// ).unwrap();
+    /// assert_eq!(old, (42, Some(43)));
+    /// ```
+    #[inline]
+    pub fn compute_if_present_locked_with_siblings<F>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<(usize, Option<usize>)>
+    where
+        F: FnMut(usize, &crate::NodeView<'_>) -> Option<usize>,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner
+            .compute_if_present_locked_with_siblings(&key, &mut f, guard)
     }
 
     /// Compute or insert the value if the key is not in the tree.
