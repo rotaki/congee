@@ -37,6 +37,45 @@ impl NodeStats {
         (n4_memory, n16_memory, n48_memory, n256_memory)
     }
 
+    /// Memory breakdown for leaf-specialized node types in bytes
+    /// Returns (n4_leaf, n16_leaf, n48_leaf, n256_leaf).
+    pub fn leaf_memory_by_node_type(&self) -> (usize, usize, usize, usize) {
+        let n4 = NodeType::N4Leaf.node_layout().size();
+        let n16 = NodeType::N16Leaf.node_layout().size();
+        let n48 = NodeType::N48Leaf.node_layout().size();
+        let n256 = NodeType::N256Leaf.node_layout().size();
+        let n4_mem: usize = self
+            .levels
+            .values()
+            .map(|l| l.n4_leaf.node_count * n4)
+            .sum();
+        let n16_mem: usize = self
+            .levels
+            .values()
+            .map(|l| l.n16_leaf.node_count * n16)
+            .sum();
+        let n48_mem: usize = self
+            .levels
+            .values()
+            .map(|l| l.n48_leaf.node_count * n48)
+            .sum();
+        let n256_mem: usize = self
+            .levels
+            .values()
+            .map(|l| l.n256_leaf.node_count * n256)
+            .sum();
+        (n4_mem, n16_mem, n48_mem, n256_mem)
+    }
+
+    /// Total count of leaf-specialized nodes by type: (n4, n16, n48, n256).
+    pub fn leaf_node_counts(&self) -> (usize, usize, usize, usize) {
+        let n4: usize = self.levels.values().map(|l| l.n4_leaf.node_count).sum();
+        let n16: usize = self.levels.values().map(|l| l.n16_leaf.node_count).sum();
+        let n48: usize = self.levels.values().map(|l| l.n48_leaf.node_count).sum();
+        let n256: usize = self.levels.values().map(|l| l.n256_leaf.node_count).sum();
+        (n4, n16, n48, n256)
+    }
+
     /// Get global prefix length distribution
     pub fn prefix_distribution(&self) -> &[usize; 9] {
         &self.prefix_distribution
@@ -215,6 +254,10 @@ pub struct LevelStats {
     n16: NodeInfo,
     n48: NodeInfo,
     n256: NodeInfo,
+    n4_leaf: NodeInfo,
+    n16_leaf: NodeInfo,
+    n48_leaf: NodeInfo,
+    n256_leaf: NodeInfo,
     /// Prefix length distribution for this level [length_0, length_1, ..., length_8]
     prefix_distribution: [usize; 9],
 }
@@ -227,6 +270,10 @@ impl LevelStats {
             n16: NodeInfo::default(),
             n48: NodeInfo::default(),
             n256: NodeInfo::default(),
+            n4_leaf: NodeInfo::default(),
+            n16_leaf: NodeInfo::default(),
+            n48_leaf: NodeInfo::default(),
+            n256_leaf: NodeInfo::default(),
             prefix_distribution: [0; 9],
         }
     }
@@ -236,14 +283,32 @@ impl LevelStats {
             + self.n16.node_count * NodeType::N16.node_layout().size()
             + self.n48.node_count * NodeType::N48.node_layout().size()
             + self.n256.node_count * NodeType::N256.node_layout().size()
+            + self.n4_leaf.node_count * NodeType::N4Leaf.node_layout().size()
+            + self.n16_leaf.node_count * NodeType::N16Leaf.node_layout().size()
+            + self.n48_leaf.node_count * NodeType::N48Leaf.node_layout().size()
+            + self.n256_leaf.node_count * NodeType::N256Leaf.node_layout().size()
     }
 
     fn node_count(&self) -> usize {
-        self.n4.node_count + self.n16.node_count + self.n48.node_count + self.n256.node_count
+        self.n4.node_count
+            + self.n16.node_count
+            + self.n48.node_count
+            + self.n256.node_count
+            + self.n4_leaf.node_count
+            + self.n16_leaf.node_count
+            + self.n48_leaf.node_count
+            + self.n256_leaf.node_count
     }
 
     fn value_count(&self) -> usize {
-        self.n4.value_count + self.n16.value_count + self.n48.value_count + self.n256.value_count
+        self.n4.value_count
+            + self.n16.value_count
+            + self.n48.value_count
+            + self.n256.value_count
+            + self.n4_leaf.value_count
+            + self.n16_leaf.value_count
+            + self.n48_leaf.value_count
+            + self.n256_leaf.value_count
     }
 }
 
@@ -330,11 +395,33 @@ impl<const K_LEN: usize> CongeeVisitor<K_LEN> for StatsVisitor {
                     .n256
                     .value_count += node.as_ref().value_count();
             }
+            crate::nodes::NodeType::N4Leaf => {
+                let entry = self.node_stats.levels.get_mut(&tree_level).unwrap();
+                entry.n4_leaf.node_count += 1;
+                entry.n4_leaf.value_count += node.as_ref().value_count();
+            }
+            crate::nodes::NodeType::N16Leaf => {
+                let entry = self.node_stats.levels.get_mut(&tree_level).unwrap();
+                entry.n16_leaf.node_count += 1;
+                entry.n16_leaf.value_count += node.as_ref().value_count();
+            }
+            crate::nodes::NodeType::N48Leaf => {
+                let entry = self.node_stats.levels.get_mut(&tree_level).unwrap();
+                entry.n48_leaf.node_count += 1;
+                entry.n48_leaf.value_count += node.as_ref().value_count();
+            }
+            crate::nodes::NodeType::N256Leaf => {
+                let entry = self.node_stats.levels.get_mut(&tree_level).unwrap();
+                entry.n256_leaf.node_count += 1;
+                entry.n256_leaf.value_count += node.as_ref().value_count();
+            }
         }
     }
 }
 
-impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
+impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool>
+    CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
     /// Returns the node stats for the tree.
     pub fn stats(&self) -> NodeStats {
         let mut visitor = StatsVisitor {

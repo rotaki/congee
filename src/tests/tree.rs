@@ -135,7 +135,8 @@ fn test_get_apply_with_siblings_boundary() {
 fn test_sparse_keys() {
     use crate::utils::leak_check::LeakCheckAllocator;
     let key_cnt = 100_000;
-    let tree = CongeeInner::new(LeakCheckAllocator::new(), Arc::new(|_k, _v| {}));
+    let tree: CongeeInner<8, LeakCheckAllocator, false> =
+        CongeeInner::new(LeakCheckAllocator::new(), Arc::new(|_k, _v| {}));
     let mut keys = Vec::<usize>::with_capacity(key_cnt);
 
     let guard = crossbeam_epoch::pin();

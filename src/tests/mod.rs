@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::DefaultAllocator;
 
 mod alloc;
+mod map_u32;
 mod memory_stats;
 mod scan;
 mod tree;

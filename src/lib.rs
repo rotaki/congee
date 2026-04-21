@@ -7,6 +7,7 @@ mod congee;
 pub mod congee_compact_set;
 mod congee_inner;
 mod congee_raw;
+mod congee_raw_u32;
 mod congee_set;
 mod error;
 mod lock;
@@ -28,6 +29,7 @@ pub mod epoch {
 pub use congee::Congee;
 pub use congee_compact_set::{CompactSetStats, CongeeCompactSet};
 pub use congee_raw::CongeeRaw;
+pub use congee_raw_u32::CongeeRawU32;
 pub use congee_set::CongeeSet;
 pub use node_view::NodeView;
 pub use utils::{Allocator, DefaultAllocator, MemoryStatsAllocator};

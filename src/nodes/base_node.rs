@@ -13,9 +13,13 @@ use crate::{
     nodes::{
         AllocatedNode, NodePtr,
         node_4::{Node4, Node4Iter},
+        node_4_leaf::{Node4Leaf, Node4LeafIter},
         node_16::{Node16, Node16Iter},
+        node_16_leaf::{Node16Leaf, Node16LeafIter},
         node_48::{Node48, Node48Iter},
+        node_48_leaf::{Node48Leaf, Node48LeafIter},
         node_256::{Node256, Node256Iter},
+        node_256_leaf::{Node256Leaf, Node256LeafIter},
     },
 };
 
@@ -38,6 +42,10 @@ pub(crate) enum NodeType {
     N16 = 1,
     N48 = 2,
     N256 = 3,
+    N4Leaf = 4,
+    N16Leaf = 5,
+    N48Leaf = 6,
+    N256Leaf = 7,
 }
 
 impl NodeType {
@@ -63,7 +71,35 @@ impl NodeType {
                 std::mem::align_of::<Node256>(),
             )
             .unwrap(),
+            NodeType::N4Leaf => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node4Leaf>(),
+                std::mem::align_of::<Node4Leaf>(),
+            )
+            .unwrap(),
+            NodeType::N16Leaf => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node16Leaf>(),
+                std::mem::align_of::<Node16Leaf>(),
+            )
+            .unwrap(),
+            NodeType::N48Leaf => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node48Leaf>(),
+                std::mem::align_of::<Node48Leaf>(),
+            )
+            .unwrap(),
+            NodeType::N256Leaf => std::alloc::Layout::from_size_align(
+                std::mem::size_of::<Node256Leaf>(),
+                std::mem::align_of::<Node256Leaf>(),
+            )
+            .unwrap(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_leaf_family(&self) -> bool {
+        matches!(
+            self,
+            NodeType::N4Leaf | NodeType::N16Leaf | NodeType::N48Leaf | NodeType::N256Leaf
+        )
     }
 }
 
@@ -84,6 +120,10 @@ pub(crate) enum NodeIter<'a> {
     N16(Node16Iter<'a>),
     N48(Node48Iter<'a>),
     N256(Node256Iter<'a>),
+    N4Leaf(Node4LeafIter<'a>),
+    N16Leaf(Node16LeafIter<'a>),
+    N48Leaf(Node48LeafIter<'a>),
+    N256Leaf(Node256LeafIter<'a>),
 }
 
 impl Iterator for NodeIter<'_> {
@@ -95,6 +135,10 @@ impl Iterator for NodeIter<'_> {
             NodeIter::N16(iter) => iter.next(),
             NodeIter::N48(iter) => iter.next(),
             NodeIter::N256(iter) => iter.next(),
+            NodeIter::N4Leaf(iter) => iter.next(),
+            NodeIter::N16Leaf(iter) => iter.next(),
+            NodeIter::N48Leaf(iter) => iter.next(),
+            NodeIter::N256Leaf(iter) => iter.next(),
         }
     }
 }
@@ -159,6 +203,22 @@ macro_rules! gen_method {
                         let node = self.as_n256();
                         node.$method_name($($arg_n),*)
                     },
+                    NodeType::N4Leaf => {
+                        let node = self.as_n4_leaf();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N16Leaf => {
+                        let node = self.as_n16_leaf();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N48Leaf => {
+                        let node = self.as_n48_leaf();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N256Leaf => {
+                        let node = self.as_n256_leaf();
+                        node.$method_name($($arg_n),*)
+                    },
                 }
             }
         }
@@ -184,6 +244,22 @@ macro_rules! gen_method_mut {
                     },
                     NodeType::N256 => {
                         let node = self.as_n256_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N4Leaf => {
+                        let node = self.as_n4_leaf_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N16Leaf => {
+                        let node = self.as_n16_leaf_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N48Leaf => {
+                        let node = self.as_n48_leaf_mut();
+                        node.$method_name($($arg_n),*)
+                    },
+                    NodeType::N256Leaf => {
+                        let node = self.as_n256_leaf_mut();
                         node.$method_name($($arg_n),*)
                     },
                 }
@@ -235,6 +311,11 @@ impl BaseNode {
 
             if matches!(N::get_type(), NodeType::N48) {
                 let mem = base_ptr as *mut Node48;
+                (*mem).init_empty();
+            }
+
+            if matches!(N::get_type(), NodeType::N48Leaf) {
+                let mem = base_ptr as *mut Node48Leaf;
                 (*mem).init_empty();
             }
 
@@ -305,6 +386,46 @@ impl BaseNode {
     pub(crate) fn as_n256_mut(&mut self) -> &mut Node256 {
         debug_assert!(matches!(self.get_type(), NodeType::N256));
         unsafe { &mut *(self as *mut BaseNode as *mut Node256) }
+    }
+
+    pub(crate) fn as_n4_leaf(&self) -> &Node4Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N4Leaf));
+        unsafe { &*(self as *const BaseNode as *const Node4Leaf) }
+    }
+
+    pub(crate) fn as_n16_leaf(&self) -> &Node16Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N16Leaf));
+        unsafe { &*(self as *const BaseNode as *const Node16Leaf) }
+    }
+
+    pub(crate) fn as_n48_leaf(&self) -> &Node48Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N48Leaf));
+        unsafe { &*(self as *const BaseNode as *const Node48Leaf) }
+    }
+
+    pub(crate) fn as_n256_leaf(&self) -> &Node256Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N256Leaf));
+        unsafe { &*(self as *const BaseNode as *const Node256Leaf) }
+    }
+
+    pub(crate) fn as_n4_leaf_mut(&mut self) -> &mut Node4Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N4Leaf));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node4Leaf) }
+    }
+
+    pub(crate) fn as_n16_leaf_mut(&mut self) -> &mut Node16Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N16Leaf));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node16Leaf) }
+    }
+
+    pub(crate) fn as_n48_leaf_mut(&mut self) -> &mut Node48Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N48Leaf));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node48Leaf) }
+    }
+
+    pub(crate) fn as_n256_leaf_mut(&mut self) -> &mut Node256Leaf {
+        debug_assert!(matches!(self.get_type(), NodeType::N256Leaf));
+        unsafe { &mut *(self as *mut BaseNode as *mut Node256Leaf) }
     }
 
     fn read_lock_inner<'a>(node: NonNull<BaseNode>) -> Result<ReadGuard<'a>, ArtError> {
@@ -421,6 +542,34 @@ impl BaseNode {
                 guard,
             ),
             NodeType::N256 => Self::insert_grow::<Node256, Node256, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N4Leaf => Self::insert_grow::<Node4Leaf, Node16Leaf, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N16Leaf => Self::insert_grow::<Node16Leaf, Node48Leaf, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N48Leaf => Self::insert_grow::<Node48Leaf, Node256Leaf, A>(
+                node.into_typed(),
+                parent,
+                val,
+                allocator,
+                guard,
+            ),
+            NodeType::N256Leaf => Self::insert_grow::<Node256Leaf, Node256Leaf, A>(
                 node.into_typed(),
                 parent,
                 val,

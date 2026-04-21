@@ -6,7 +6,9 @@ use crate::{
     Allocator, DefaultAllocator, NodeView, cast_ptr,
     error::{ArtError, OOMError},
     lock::ReadGuard,
-    nodes::{BaseNode, ChildIsPayload, ChildIsSubNode, Node, Node4, NodePtr, NodeType, Parent},
+    nodes::{
+        BaseNode, ChildIsPayload, ChildIsSubNode, Node, Node4, Node4Leaf, NodePtr, NodeType, Parent,
+    },
     range_scan::RangeScan,
     utils::{Backoff, KeyTracker},
 };
@@ -20,6 +22,7 @@ use std::sync::atomic::AtomicPtr;
 pub(crate) struct CongeeInner<
     const K_LEN: usize,
     A: Allocator + Clone + Send + 'static = DefaultAllocator, // Allocator must be clone because it is used in the epoch guard.
+    const LEAF_IS_U32: bool = false,
 > {
     pub(crate) root: AtomicPtr<BaseNode>,
     drain_callback: Arc<dyn Fn([u8; K_LEN], usize)>,
@@ -27,10 +30,16 @@ pub(crate) struct CongeeInner<
     _pt_key: PhantomData<[u8; K_LEN]>,
 }
 
-unsafe impl<const K_LEN: usize, A: Allocator + Clone + Send> Send for CongeeInner<K_LEN, A> {}
-unsafe impl<const K_LEN: usize, A: Allocator + Clone + Send> Sync for CongeeInner<K_LEN, A> {}
+unsafe impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool> Send
+    for CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
+}
+unsafe impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool> Sync
+    for CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
+}
 
-impl<const K_LEN: usize> Default for CongeeInner<K_LEN> {
+impl<const K_LEN: usize> Default for CongeeInner<K_LEN, DefaultAllocator, false> {
     fn default() -> Self {
         Self::new(DefaultAllocator {}, Arc::new(|_: [u8; K_LEN], _: usize| {}))
     }
@@ -81,7 +90,9 @@ impl<const K_LEN: usize> CongeeVisitor<K_LEN> for ValueCountVisitor<K_LEN> {
     }
 }
 
-impl<const K_LEN: usize, A: Allocator + Clone + Send> Drop for CongeeInner<K_LEN, A> {
+impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool> Drop
+    for CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
     fn drop(&mut self) {
         let mut visitor = DropVisitor::<K_LEN, A> {
             allocator: self.allocator.clone(),
@@ -96,7 +107,9 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> Drop for CongeeInner<K_LEN
     }
 }
 
-impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
+impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool>
+    CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
     pub fn new(allocator: A, drain_callback: Arc<dyn Fn([u8; K_LEN], usize)>) -> Self {
         let root = BaseNode::make_node::<Node4, A>(&[], &allocator)
             .expect("Can't allocate memory for root node!");
@@ -116,7 +129,9 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
     }
 }
 
-impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
+impl<const K_LEN: usize, A: Allocator + Clone + Send, const LEAF_IS_U32: bool>
+    CongeeInner<K_LEN, A, LEAF_IS_U32>
+{
     pub(crate) fn is_empty(&self, _guard: &Guard) -> bool {
         loop {
             let root = self.load_root();
@@ -420,17 +435,31 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                                 Ok(_is_last_level) => NodePtr::from_payload(tid_func(None)),
                                 Err(_is_sub_node) => {
                                     // Create a new node that will hold the remaining part of the key
-                                    // The prefix should be the remaining bytes after current level
+                                    // The prefix should be the remaining bytes after current level.
+                                    // The new node's child array is indexed by k[k.len() - 1]
+                                    // (the final byte), so it's always a terminal/leaf node.
                                     let remaining_prefix = &k[level + 1..k.len() - 1];
-                                    let mut n4 = BaseNode::make_node::<Node4, A>(
-                                        remaining_prefix,
-                                        &self.allocator,
-                                    )?;
-                                    n4.as_mut().insert(
-                                        k[k.len() - 1],
-                                        NodePtr::from_payload(tid_func(None)),
-                                    );
-                                    n4.into_note_ptr()
+                                    if LEAF_IS_U32 {
+                                        let mut n4 = BaseNode::make_node::<Node4Leaf, A>(
+                                            remaining_prefix,
+                                            &self.allocator,
+                                        )?;
+                                        n4.as_mut().insert(
+                                            k[k.len() - 1],
+                                            NodePtr::from_payload(tid_func(None)),
+                                        );
+                                        n4.into_note_ptr()
+                                    } else {
+                                        let mut n4 = BaseNode::make_node::<Node4, A>(
+                                            remaining_prefix,
+                                            &self.allocator,
+                                        )?;
+                                        n4.as_mut().insert(
+                                            k[k.len() - 1],
+                                            NodePtr::from_payload(tid_func(None)),
+                                        );
+                                        n4.into_note_ptr()
+                                    }
                                 }
                             }
                         };
@@ -507,18 +536,33 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                             .as_mut()
                             .insert(k[next_level], NodePtr::from_payload(tid_func(None)));
                     } else {
-                        // otherwise create a new node
-                        let mut single_new_node = BaseNode::make_node::<Node4, A>(
-                            &k[(next_level + 1)..k.len() - 1],
-                            &self.allocator,
-                        )?;
+                        // otherwise create a new node. Its single child is at
+                        // k[k.len() - 1] (the terminal byte) — always a leaf.
+                        if LEAF_IS_U32 {
+                            let mut single_new_node = BaseNode::make_node::<Node4Leaf, A>(
+                                &k[(next_level + 1)..k.len() - 1],
+                                &self.allocator,
+                            )?;
 
-                        single_new_node
-                            .as_mut()
-                            .insert(k[k.len() - 1], NodePtr::from_payload(tid_func(None)));
-                        new_middle_node
-                            .as_mut()
-                            .insert(k[next_level], single_new_node.into_note_ptr());
+                            single_new_node
+                                .as_mut()
+                                .insert(k[k.len() - 1], NodePtr::from_payload(tid_func(None)));
+                            new_middle_node
+                                .as_mut()
+                                .insert(k[next_level], single_new_node.into_note_ptr());
+                        } else {
+                            let mut single_new_node = BaseNode::make_node::<Node4, A>(
+                                &k[(next_level + 1)..k.len() - 1],
+                                &self.allocator,
+                            )?;
+
+                            single_new_node
+                                .as_mut()
+                                .insert(k[k.len() - 1], NodePtr::from_payload(tid_func(None)));
+                            new_middle_node
+                                .as_mut()
+                                .insert(k[next_level], single_new_node.into_note_ptr());
+                        }
                     }
 
                     new_middle_node
@@ -781,6 +825,10 @@ impl<const K_LEN: usize, A: Allocator + Clone + Send> CongeeInner<K_LEN, A> {
                 (NodeType::N16, true) => CompactNodeType::N16_LEAF,
                 (NodeType::N48, true) => CompactNodeType::N48_LEAF,
                 (NodeType::N256, true) => CompactNodeType::N256_LEAF,
+                (NodeType::N4Leaf, _) => CompactNodeType::N4_LEAF,
+                (NodeType::N16Leaf, _) => CompactNodeType::N16_LEAF,
+                (NodeType::N48Leaf, _) => CompactNodeType::N48_LEAF,
+                (NodeType::N256Leaf, _) => CompactNodeType::N256_LEAF,
             };
 
             nodes_data.push((node_type, node_prefix, children, is_leaf));
