@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::{Allocator, CongeeInner, DefaultAllocator, epoch, error::OOMError, stats};
+use crate::{Allocator, CongeeInner, DefaultAllocator, NodeView, epoch, error::OOMError, stats};
 
 /// A memory-efficient adaptive radix tree specialized for `usize -> u32` maps.
 ///
@@ -90,6 +90,31 @@ where
         self.inner.get_apply(&key, &mut |v| f(v as u32), guard)
     }
 
+    /// Like [`CongeeRawU32::get_apply`], but also exposes sibling payloads in
+    /// the same leaf node via [`NodeView`].
+    ///
+    /// `view.siblings_after()` yields `(u8, usize)` pairs; the `usize` values
+    /// are this tree's `u32` payloads widened with `as usize`. Narrow them back
+    /// with `v as u32` inside the closure.
+    ///
+    /// The sibling view is checked against the node version after the closure
+    /// returns. Under contention, the closure may be retried.
+    #[inline]
+    pub fn get_apply_with_siblings<F, R>(
+        &self,
+        key: &K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Option<R>
+    where
+        F: FnMut(u32, &NodeView<'_>) -> R,
+    {
+        let key = usize::from(*key);
+        let key: [u8; 8] = key.to_be_bytes();
+        self.inner
+            .get_apply_with_siblings(&key, &mut |v, view| f(v as u32, view), guard)
+    }
+
     /// Insert a key-value pair; returns the previous value if present.
     #[inline]
     pub fn insert(&self, k: K, v: u32, guard: &epoch::Guard) -> Result<Option<u32>, OOMError> {
@@ -126,6 +151,32 @@ where
         self.inner
             .compute_if_present(&key, &mut g, guard)
             .map(|(old, new)| (old as u32, new.map(|v| v as u32)))
+    }
+
+    /// Compute or insert the value for `key`.
+    ///
+    /// The closure is called with `Some(old)` if the key is present and
+    /// `None` if it is not. Its return value is stored (replacing or inserting).
+    ///
+    /// Returns the previous value (`Some(old)`) if the key existed, or `None`
+    /// if this call inserted a new entry.
+    ///
+    /// The closure holds an exclusive lock on the leaf node, so keep it short.
+    /// It must also be safe to invoke more than once under contention.
+    pub fn compute_or_insert<F>(
+        &self,
+        key: K,
+        mut f: F,
+        guard: &epoch::Guard,
+    ) -> Result<Option<u32>, OOMError>
+    where
+        F: FnMut(Option<u32>) -> u32,
+    {
+        let key = usize::from(key);
+        let key: [u8; 8] = key.to_be_bytes();
+        let mut g = |v: Option<usize>| f(v.map(|x| x as u32)) as usize;
+        let u_val = self.inner.compute_or_insert(&key, &mut g, guard)?;
+        Ok(u_val.map(|v| v as u32))
     }
 
     /// Range scan. Writes up to `result.len()` matches into `result`; returns

@@ -97,6 +97,71 @@ fn compute_if_present_updates() {
 }
 
 #[test]
+fn get_apply_with_siblings_yields_other_leaf_values() {
+    // Insert several keys that share a leaf node (same 7-byte prefix), then
+    // read one and iterate siblings after its byte. They are u32 payloads
+    // widened to usize by the NodeView API.
+    let tree = CongeeRawU32::<usize>::default();
+    let guard = tree.pin();
+
+    // keys 10, 20, 30, 40 differ only at byte 7 so they share one leaf.
+    for k in [10usize, 20, 30, 40] {
+        tree.insert(k, (k as u32) * 100, &guard).unwrap();
+    }
+
+    let siblings = tree
+        .get_apply_with_siblings(
+            &20usize,
+            |v, view| {
+                let mut out = vec![(view.target_byte(), v)];
+                for (byte, val) in view.siblings_after() {
+                    out.push((byte, val as u32));
+                }
+                out
+            },
+            &guard,
+        )
+        .unwrap();
+
+    // target 20, then siblings 30 and 40 (after byte 20).
+    assert_eq!(siblings, vec![(20, 2000), (30, 3000), (40, 4000)]);
+}
+
+#[test]
+fn compute_or_insert_handles_absent_and_present() {
+    let tree = CongeeRawU32::<usize>::default();
+    let guard = tree.pin();
+
+    // Absent: closure gets None, return value is inserted, prior returned as None.
+    let prior = tree
+        .compute_or_insert(
+            5,
+            |v| {
+                assert!(v.is_none());
+                77
+            },
+            &guard,
+        )
+        .unwrap();
+    assert_eq!(prior, None);
+    assert_eq!(tree.get(&5, &guard), Some(77));
+
+    // Present: closure gets Some(old), return value replaces, prior returned as Some(old).
+    let prior = tree
+        .compute_or_insert(
+            5,
+            |v| {
+                assert_eq!(v, Some(77));
+                v.unwrap() + 1
+            },
+            &guard,
+        )
+        .unwrap();
+    assert_eq!(prior, Some(77));
+    assert_eq!(tree.get(&5, &guard), Some(78));
+}
+
+#[test]
 fn get_apply_returns_value() {
     let tree = CongeeRawU32::<usize>::default();
     let guard = tree.pin();
